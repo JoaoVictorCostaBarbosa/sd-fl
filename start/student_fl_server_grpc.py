@@ -45,8 +45,14 @@ class FederatedLearningServicer(federated_pb2_grpc.FederatedLearningServicer):
         - mesma lógica do cliente em params_to_proto
         - servidor e cliente devem serializar no mesmo formato
         """
-        # TODO: implemente a serialização do modelo para protobuf
-        raise NotImplementedError("Implemente _params_to_proto")
+        coef, intercept = params
+        coef = np.asarray(coef, dtype=np.float64)
+        intercept = np.asarray(intercept, dtype=np.float64)
+        return federated_pb2.ModelParameters(
+            coef_values=coef.ravel().tolist(),
+            coef_shape=list(coef.shape),
+            intercept_values=intercept.ravel().tolist(),
+        )
 
 
     def _proto_to_params(self, proto_params):
@@ -56,8 +62,11 @@ class FederatedLearningServicer(federated_pb2_grpc.FederatedLearningServicer):
         Dica:
         - mesma lógica do cliente em params_from_proto
         """
-        # TODO: implemente a desserialização do protobuf para NumPy
-        raise NotImplementedError("Implemente _proto_to_params")
+        coef = np.array(proto_params.coef_values, dtype=np.float64).reshape(
+            list(proto_params.coef_shape)
+        )
+        intercept = np.array(proto_params.intercept_values, dtype=np.float64)
+        return [coef, intercept]
 
     def GetGlobalModel(self, request, context):
         """
@@ -68,10 +77,15 @@ class FederatedLearningServicer(federated_pb2_grpc.FederatedLearningServicer):
         - a mensagem pode ser algo como "Treinamento encerrado" ou "Modelo global disponível"
         """
         with self.lock:
-            # TODO: calcule done
-            # TODO: monte proto a partir dos parâmetros globais
-            # TODO: retorne federated_pb2.GlobalModel(...)
-            raise NotImplementedError("Implemente GetGlobalModel")
+            done = self.current_round > self.total_rounds
+            model_proto = self._params_to_proto(self.global_params)
+            return federated_pb2.GlobalModel(
+                round=self.current_round,
+                total_rounds=self.total_rounds,
+                done=done,
+                message="Treinamento encerrado" if done else "Modelo global disponível",
+                model=model_proto,
+            )
 
     def _validate_update(self, request):
         """
@@ -84,8 +98,18 @@ class FederatedLearningServicer(federated_pb2_grpc.FederatedLearningServicer):
         4. Caso contrário aceite e mensagem "OK".
         Retorne uma tupla: (accepted: bool, message: str)
         """
-        # TODO: implemente as quatro verificações acima
-        raise NotImplementedError("Implemente _validate_update")
+        if self.current_round > self.total_rounds:
+            return False, "O treinamento já terminou."
+        if request.round != self.current_round:
+            return False, (
+                f"Rodada inválida: recebida {request.round}, "
+                f"rodada atual é {self.current_round}."
+            )
+        if request.cid in self.received_updates:
+            return False, (
+                f"Atualização duplicada do cliente {request.cid} na rodada {self.current_round}."
+            )
+        return True, "OK"
 
 
     def _consolidate_round_if_ready(self):
@@ -102,8 +126,33 @@ class FederatedLearningServicer(federated_pb2_grpc.FederatedLearningServicer):
         - avançar current_round
         - se a última rodada terminou, sinalizar training_finished
         """
-        # TODO: implemente a consolidação da rodada
-        raise NotImplementedError("Implemente _consolidate_round_if_ready")
+        if len(self.received_updates) != self.num_clients:
+            return
+
+        updates = list(self.received_updates.values())
+        self.global_params = aggregate_fedavg(updates)
+
+        loss, acc = evaluate_global_model(
+            self.global_params,
+            self.model_template,
+            self.X_test_global,
+            self.y_test_global,
+        )
+        avg_train_loss = sum(u["train_loss"] for u in updates) / len(updates)
+        avg_train_acc = sum(u["train_acc"] for u in updates) / len(updates)
+
+        print(
+            f"[Servidor] Rodada {self.current_round}/{self.total_rounds} consolidada | "
+            f"treino local: loss={avg_train_loss:.4f} acc={avg_train_acc:.4f} | "
+            f"modelo global: loss={loss:.4f} acc={acc:.4f}"
+        )
+
+        # Limpa o buffer ANTES de avançar a rodada.
+        self.received_updates = {}
+        self.current_round += 1
+
+        if self.current_round > self.total_rounds:
+            self.training_finished.set()
 
 
     def SubmitUpdate(self, request, context):
@@ -118,18 +167,30 @@ class FederatedLearningServicer(federated_pb2_grpc.FederatedLearningServicer):
         5. Retornar UpdateAck(accepted=True, ...)
         """
         with self.lock:
-            # TODO: validar a atualização
-            
-            # TODO: armazenar a atualização recebida
-            
-            # Dica: salve params, num_examples, train_loss e train_acc
-            
-            # TODO: imprimir um log curto identificando cliente e rodada
+            accepted, message = self._validate_update(request)
+            if not accepted:
+                return federated_pb2.UpdateAck(
+                    accepted=False,
+                    message=message,
+                    server_round=self.current_round,
+                )
 
-            # TODO: consolidar a rodada se todos os clientes já enviaram
+            params = self._proto_to_params(request.model)
+            self.received_updates[request.cid] = {
+                "params": params,
+                "num_examples": request.num_examples,
+                "train_loss": request.train_loss,
+                "train_acc": request.train_acc,
+            }
+            print(f"[Servidor] Atualização recebida do cliente {request.cid} na rodada {request.round}")
 
-            # TODO: retornar UpdateAck de sucesso
-            raise NotImplementedError("Implemente SubmitUpdate")
+            self._consolidate_round_if_ready()
+
+            return federated_pb2.UpdateAck(
+                accepted=True,
+                message="Atualização aceita",
+                server_round=self.current_round,
+            )
 
 
 

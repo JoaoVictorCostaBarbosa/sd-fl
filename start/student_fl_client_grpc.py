@@ -25,8 +25,11 @@ def params_from_proto(proto_params):
     - coef_shape diz como reconstruir a matriz original
     - intercept_values contém o vetor de interceptos
     """
-    # TODO: implemente a conversão do protobuf para NumPy.
-    raise NotImplementedError("Implemente params_from_proto")
+    coef = np.array(proto_params.coef_values, dtype=np.float64).reshape(
+        list(proto_params.coef_shape)
+    )
+    intercept = np.array(proto_params.intercept_values, dtype=np.float64)
+    return [coef, intercept]
 
 
 
@@ -39,8 +42,14 @@ def params_to_proto(params):
     - use list(coef.shape) para guardar o formato
     - use intercept.ravel().tolist() para serializar o intercepto
     """
-    # TODO: implemente a conversão de NumPy para protobuf.
-    raise NotImplementedError("Implemente params_to_proto")
+    coef, intercept = params
+    coef = np.asarray(coef, dtype=np.float64)
+    intercept = np.asarray(intercept, dtype=np.float64)
+    return federated_pb2.ModelParameters(
+        coef_values=coef.ravel().tolist(),
+        coef_shape=list(coef.shape),
+        intercept_values=intercept.ravel().tolist(),
+    )
 
 
 
@@ -58,8 +67,14 @@ def build_client_update(cid, round_number, train_result):
 
     Parâmetro model em ClientUpdate espera o tipo ModelParameters
     """
-    # TODO: crie e retorne federated_pb2.ClientUpdate(...)
-    raise NotImplementedError("Implemente build_client_update")
+    return federated_pb2.ClientUpdate(
+        cid=cid,
+        round=round_number,
+        num_examples=train_result["num_examples"],
+        train_loss=train_result["train_loss"],
+        train_acc=train_result["train_acc"],
+        model=params_to_proto(train_result["params"]),
+    )
 
 
 
@@ -101,29 +116,56 @@ def run_client(cid: int, server_address: str, num_clients: int, poll_interval: f
         stub = federated_pb2_grpc.FederatedLearningStub(channel)
 
         while True:
-            # TODO: peça o modelo global ao servidor com GetGlobalModel(...)
+            # Pede o modelo global atual ao servidor.
+            try:
+                global_model = stub.GetGlobalModel(federated_pb2.ClientHello(cid=cid))
+            except grpc.RpcError as exc:
+                if exc.code() == grpc.StatusCode.UNAVAILABLE:
+                    print(f"[Cliente {cid}] Servidor finalizou. Encerrando cliente.")
+                    break
+                raise
 
-            # TODO: se global_model.done for True, avise no terminal e encerre o loop
-            
-            # Cliente dorme por um período
+            # Treinamento encerrado.
+            if global_model.done:
+                print(f"[Cliente {cid}] Treinamento federado concluído. Encerrando cliente.")
+                break
 
-            # TODO: converta o modelo global recebido para parâmetros locais
+            # Rodada já processada por este cliente: espera o servidor avançar.
+            if should_wait(global_model.round, completed_round):
+                time.sleep(poll_interval)
+                continue
 
-            # TODO: treine localmente usando local_train(...)
+            global_params = params_from_proto(global_model.model)
 
-            # TODO: monte o update com build_client_update(...)
+            train_result = local_train(
+                X_train=X_train,
+                y_train=y_train,
+                global_params=global_params,
+                model_template=model_template,
+                local_epochs=local_epochs,
+            )
 
-            # TODO: envie o update com stub.SubmitUpdate(...). Use try...except p/ lidar com a exceção grpc.RpcError.
-            # Se seu código for grpc.StatusCode.UNAVAILABLE, imprima que o servidor finalizou e que estará finalizando
-            # o cliente.
+            update = build_client_update(cid, global_model.round, train_result)
 
-            # TODO: se ack.accepted for True:
-            #   - atualize completed_round
-            #   - imprima a loss e a acc locais
-            # senão:
-            #   - imprima a mensagem de recusa
+            try:
+                ack = stub.SubmitUpdate(update)
+            except grpc.RpcError as exc:
+                if exc.code() == grpc.StatusCode.UNAVAILABLE:
+                    print(f"[Cliente {cid}] Servidor finalizou. Encerrando cliente.")
+                    break
+                raise
 
-            # TODO: faça uma pequena espera entre as iterações
+            if ack.accepted:
+                # Só marca a rodada como concluída após o aceite do servidor.
+                completed_round = global_model.round
+                print(
+                    f"[Cliente {cid}] Rodada {global_model.round} enviada | "
+                    f"loss={train_result['train_loss']:.4f} acc={train_result['train_acc']:.4f}"
+                )
+            else:
+                print(f"[Cliente {cid}] Atualização recusada: {ack.message}")
+
+            time.sleep(poll_interval)
 
 
 if __name__ == "__main__":
