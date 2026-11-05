@@ -1,0 +1,35 @@
+# 1. Ambiente virtual (se já existir uma .venv quebrada, apague antes)
+rm -rf .venv
+python3 -m venv .venv
+source .venv/bin/activate
+
+# 2. Bibliotecas
+pip install flwr-datasets numpy pandas scikit-learn grpcio grpcio-tools
+
+# 3. Gerar os arquivos protobuf
+cd start
+python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. federated.proto
+
+# 4. Testes unitários
+python -m unittest discover -s tests -v
+
+--------------------------------------------------------------------------------------
+
+# Terminal 1: servidor (inicie primeiro e espere "Servidor gRPC ouvindo")
+python student_fl_server_grpc.py --num-clients 3 --rounds 5
+
+# Terminal 2
+python student_fl_client_grpc.py --cid 0 --num-clients 3
+
+# Terminal 3
+python student_fl_client_grpc.py --cid 1 --num-clients 3
+
+# Terminal 4
+python student_fl_client_grpc.py --cid 2 --num-clients 3
+
+--------------------------------------------------------------------------------------
+
+python student_fl_server_grpc.py --num-clients 3 --rounds 5 &
+sleep 10
+for i in 0 1 2; do python student_fl_client_grpc.py --cid $i --num-clients 3 & done
+wait
